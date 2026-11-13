@@ -4,9 +4,11 @@
 流程
 ----
 1. 读取原始分辨率 CTA，按训练时的约定缩放至 (256, 256, 160)；
-2. 用 Focus 模型预测低分辨率粗分割；
-3. 对粗分割做阈值化 + 最大连通域 + 质心，映射回原始分辨率坐标，
-   从原始分辨率图像中裁剪 128^3 聚焦框，并记录 origin / 原始 affine；
+2. 用 Focus 模型预测低分辨率粗分割，并以 save_probabilities=True 保存
+   class-1 概率图（<case>.npz）；若复用的预测目录里没有 .npz，则退回 label map；
+3. 对 class-1 概率图按 --threshold（默认 0.10）阈值化，再做最大连通域 + 质心，
+   映射回原始分辨率坐标，从原始分辨率图像中裁剪 128^3 聚焦框，
+   并记录 origin / 原始 affine；
 4. 用 Refinement 模型预测聚焦框；
 5. 把细化结果按 origin 贴回零值全分辨率 volume，用原始 affine/spacing 保存。
 
@@ -92,7 +94,8 @@ def parse_args():
     parser.add_argument("--lowres_dir", default=None,
                         help="复用已生成的低分辨率图像目录；不提供则自动缩放")
     parser.add_argument("--coarse_pred_dir", default=None,
-                        help="复用已有的 Focus 预测目录（<case>.nii.gz）；提供后跳过 Focus 推理")
+                        help="复用已有的 Focus 预测目录（<case>.npz 概率图或 "
+                             "<case>.nii.gz label map）；提供后跳过 Focus 推理")
     parser.add_argument("--refined_dir", default=None,
                         help="复用已有的 Refinement 预测目录（<case>.nii.gz）；提供后跳过 Refinement 推理")
 
@@ -100,7 +103,8 @@ def parse_args():
                         help="Focus 输入尺寸，默认 256,256,160（与训练脚本一致）")
     parser.add_argument("--cube_size", type=int, default=CUBE_SIZE, help="聚焦框边长，默认 128")
     parser.add_argument("--threshold", type=float, default=0.10,
-                        help="粗分割二值化阈值，默认 0.10；nnU-Net 导出的 label map 取 >=0.10 即前景")
+                        help="粗分割 class-1 概率图阈值，默认 0.10；"
+                             "若复用目录中没有 .npz 而只有 label map，则退化为 >0")
     parser.add_argument("--device", default="cuda", help="cuda / cpu / mps")
     parser.add_argument("--npp", type=int, default=1, help="预处理进程数，Windows 下建议 1")
     parser.add_argument("--nps", type=int, default=1, help="导出进程数，Windows 下建议 1")
@@ -167,7 +171,7 @@ def detect_network_from_checkpoint(model_dir: str, fold: str, checkpoint_name: s
 
 def run_predictor(model_dir: str, input_dir: str, output_dir: str, fold: str,
                   checkpoint_name: str, network_variant: str, device: torch.device,
-                  npp: int, nps: int):
+                  npp: int, nps: int, save_probabilities: bool = False):
     from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 
     os.makedirs(output_dir, exist_ok=True)
@@ -175,7 +179,8 @@ def run_predictor(model_dir: str, input_dir: str, output_dir: str, fold: str,
     os.environ["MY_NNUNET_NETWORK"] = network_variant
     predictor = None
     try:
-        print(f"[cascade] running {network_variant} predictor: {model_dir} -> {output_dir}")
+        print(f"[cascade] running {network_variant} predictor: {model_dir} -> {output_dir} "
+              f"(save_probabilities={save_probabilities})")
         predictor = nnUNetPredictor(
             tile_step_size=0.5,
             use_gaussian=True,
@@ -191,7 +196,7 @@ def run_predictor(model_dir: str, input_dir: str, output_dir: str, fold: str,
         predictor.predict_from_files(
             input_dir,
             output_dir,
-            save_probabilities=False,
+            save_probabilities=save_probabilities,
             overwrite=True,
             num_processes_preprocessing=npp,
             num_processes_segmentation_export=nps,
@@ -238,22 +243,66 @@ def prepare_lowres(cases, lowres_dir: str, target_shape):
     return metas
 
 
+def load_coarse_prediction(coarse_pred_dir: str, case: str):
+    """优先读取 class-1 概率图（.npz），没有时退回 label map。
+
+    nnU-Net 在 ``save_probabilities=True`` 时会同时写出 ``<case>.nii.gz``
+    （argmax label map）和 ``<case>.npz``（``probabilities``，形状为
+    ``C x X x Y x Z``）。这里取 class 1 的概率图；若目录中没有 ``.npz``，
+    则使用 label map 并返回 ``"label"``，调用方会提示阈值退化为 ``>0``。
+
+    Returns
+    -------
+    (array, source) where source is ``"probability"``, ``"label"`` or ``None``.
+    """
+    npz_path = os.path.join(coarse_pred_dir, f"{case}.npz")
+    if os.path.isfile(npz_path):
+        with np.load(npz_path, allow_pickle=False) as data:
+            if "probabilities" not in data:
+                raise KeyError(f"{npz_path} does not contain a 'probabilities' array")
+            probs = np.asarray(data["probabilities"], dtype=np.float32)
+        if probs.ndim == 4:
+            if probs.shape[0] == 1:
+                probs = probs[0]
+            else:
+                probs = probs[1]  # class 1 = IA foreground
+        elif probs.ndim != 3:
+            raise ValueError(
+                f"unexpected probabilities shape in {npz_path}: {probs.shape}; "
+                "expected (C, X, Y, Z)"
+            )
+        return probs, "probability"
+
+    for ext in (".nii.gz", ".nii"):
+        nii_path = os.path.join(coarse_pred_dir, f"{case}{ext}")
+        if os.path.isfile(nii_path):
+            pred = as_3d(nib.load(nii_path).get_fdata(dtype=np.float32))
+            return pred, "label"
+    return None, None
+
+
 def build_cubes(metas, coarse_pred_dir: str, cubes_dir: str, cube_size: int,
                 threshold: float, metadata_path: str):
     """从粗分割中定位最大连通域，裁剪原始分辨率的聚焦框并记录 origin。"""
     os.makedirs(cubes_dir, exist_ok=True)
     records = {}
     for case, meta in metas.items():
-        pred_path = os.path.join(coarse_pred_dir, f"{case}.nii.gz")
         record = dict(meta)
         record["has_cube"] = False
 
-        if not os.path.isfile(pred_path):
-            print(f"[cascade][warn] no coarse prediction for {case}: {pred_path}")
+        pred, pred_source = load_coarse_prediction(coarse_pred_dir, case)
+        if pred is None:
+            print(f"[cascade][warn] no coarse prediction for {case} in {coarse_pred_dir} "
+                  "(expected <case>.npz or <case>.nii.gz)")
             records[case] = record
             continue
 
-        pred = as_3d(nib.load(pred_path).get_fdata(dtype=np.float32))
+        if pred_source == "label":
+            print(f"[cascade][warn] {case}: no .npz probabilities found; "
+                  f"falling back to label map (threshold {threshold:g} is effectively >0)")
+        record["coarse_source"] = pred_source
+        record["threshold"] = float(threshold)
+
         centroid_low = largest_component_centroid(pred >= threshold)
         if centroid_low is None:
             print(f"[cascade][warn] empty coarse prediction for {case}; final output will be empty")
@@ -359,6 +408,7 @@ def main():
         run_predictor(
             args.focus_model, lowres_dir, coarse_pred_dir, args.focus_fold,
             checkpoint, variant, torch.device(args.device), args.npp, args.nps,
+            save_probabilities=True,
         )
 
     # ---------- 3. 聚焦框 ----------
@@ -383,6 +433,7 @@ def main():
         run_predictor(
             args.refine_model, cubes_dir, refined_dir, args.refine_fold,
             checkpoint, variant, torch.device(args.device), args.npp, args.nps,
+            save_probabilities=False,
         )
 
     # ---------- 5. 回写全分辨率 ----------
