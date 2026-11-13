@@ -32,7 +32,7 @@ MY_NNUNET_NETWORK=focus      nnUNetv2_train 505 3d_lowres all
 
 ## 测试阶段（完整闭环）
 
-新增 `entry/infer_cascade.py`，一条命令完成：
+ `entry/infer_cascade.py`，一条命令完成：
 
 1. 原始分辨率 CTA 按训练约定缩放到 [256, 256, 160]；
 2. Focus 网络预测低分辨率粗分割；
